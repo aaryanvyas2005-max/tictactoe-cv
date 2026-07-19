@@ -44,10 +44,10 @@ def process_and_draw_board(image_bytes):
             start_y = y + (row * cell_h)
             end_y = start_y + cell_h
             
-            # Draw green cell boundaries
+            # Draw cell boundaries
             cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (34, 139, 34), 2)
             
-            # Reduced padding (5% instead of 10%) so we don't accidentally cut off symbols near borders
+            # Keep a tight 5% padding to maximize symbol detection space
             pad_x = max(2, int(cell_w * 0.05))
             pad_y = max(2, int(cell_h * 0.05))
             
@@ -58,31 +58,34 @@ def process_and_draw_board(image_bytes):
             
             cell_thresh = thresh[y1:y2, x1:x2]
             
-            # Analyze features inside the cell
+            # Count feature pixels
             total_pixels = cell_thresh.size
             white_pixels = cv2.countNonZero(cell_thresh)
             fill_ratio = white_pixels / total_pixels if total_pixels > 0 else 0
             
             cell_contours, _ = cv2.findContours(cell_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # Low noise threshold to make sure we don't miss clipped shapes
-            min_area = (cell_w * cell_h) * 0.02
-            valid_contours = [c for c in cell_contours if cv2.contourArea(c) > min_area]
-            
             status = "no symbol"
             text_color = (140, 140, 140) 
             
-            # Lowered fill threshold requirement to catch edge-aligned shapes
-            if len(valid_contours) > 0 or fill_ratio > 0.02:
-                # Fallback target selection
-                target_contour = max(cell_contours, key=cv2.contourArea) if len(cell_contours) > 0 else None
+            # --- CRITICAL STAGE: Gatekeep True Empty Cells ---
+            # If there's barely any pixel activity, it's definitively empty.
+            if fill_ratio < 0.045: 
+                status = "no symbol"
+                count_empty += 1
+            else:
+                # Filter out minor speckles and small noise shapes
+                min_area = (cell_w * cell_h) * 0.03
+                valid_contours = [c for c in cell_contours if cv2.contourArea(c) > min_area]
                 
-                if target_contour is not None:
+                if len(valid_contours) > 0:
+                    target_contour = max(valid_contours, key=cv2.contourArea)
+                    
                     hull = cv2.convexHull(target_contour)
                     hull_area = cv2.contourArea(hull)
                     solidity = cv2.contourArea(target_contour) / hull_area if hull_area > 0 else 0
                     
-                    # Fine-tuned threshold to cleanly split X and O structures
+                    # Split O's solid doughnut profile from X's sprawling cross profile
                     if solidity > 0.65:
                         status = "O"
                         text_color = (255, 110, 0) 
@@ -93,8 +96,6 @@ def process_and_draw_board(image_bytes):
                         count_x += 1
                 else:
                     count_empty += 1
-            else:
-                count_empty += 1
             
             status_logs.append(f"At position ({row},{col}) there is {status}")
             
@@ -108,7 +109,7 @@ def process_and_draw_board(image_bytes):
             
     return output_img, status_logs, count_x, count_o, count_empty
 
-# --- Streamlit Layout ---
+# --- Streamlit Presentation View Window ---
 st.set_page_config(page_title="CV Board Scanner Pro", page_icon="🤖", layout="wide")
 
 st.markdown("""
