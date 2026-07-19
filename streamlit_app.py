@@ -16,7 +16,7 @@ def process_and_draw_board(image_bytes):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 11, 2)
+                                   cv2.THRESH_BINARY_INV, 15, 4)
 
     # 2. Smart Boundary Detection
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -28,10 +28,9 @@ def process_and_draw_board(image_bytes):
         board_contour = max(contours, key=cv2.contourArea)
         cx, cy, cw, ch = cv2.boundingRect(board_contour)
         
-        # Security Check: Only use the contour if it takes up more than 45% of the total image area
+        # Only use the contour if it takes up a significant portion of the image area
         if (cw * ch) > (img_w * img_h * 0.45):
             x, y, w, h = cx, cy, cw, ch
-            # Draw Outer Border only if we found a valid container contour
             cv2.rectangle(output_img, (x, y), (x + w, y + h), (235, 94, 40), 4)
 
     cell_w = w // 3
@@ -51,11 +50,10 @@ def process_and_draw_board(image_bytes):
             # Draw cell boundaries
             cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (34, 139, 34), 2)
             
-            # Dynamic Padding based on cell size
-            pad_x = max(2, int(cell_w * 0.08))
-            pad_y = max(2, int(cell_h * 0.08))
+            # Dynamic Padding (Shave off 10% to completely clear grid lines)
+            pad_x = max(4, int(cell_w * 0.10))
+            pad_y = max(4, int(cell_h * 0.10))
             
-            # Ensure coordinates stay within image boundaries
             y1 = max(0, start_y + pad_y)
             y2 = min(img_h, end_y - pad_y)
             x1 = max(0, start_x + pad_x)
@@ -63,30 +61,35 @@ def process_and_draw_board(image_bytes):
             
             cell_thresh = thresh[y1:y2, x1:x2]
             
-            cell_contours, hierarchy = cv2.findContours(cell_thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+            # Count white pixels (symbol features) vs total pixels in cell area
+            total_pixels = cell_thresh.size
+            white_pixels = cv2.countNonZero(cell_thresh)
+            fill_ratio = white_pixels / total_pixels if total_pixels > 0 else 0
             
-            # Min area threshold relative to cell size to avoid noise
-            min_area = (cell_w * cell_h) * 0.05
-            valid_contours = [c for c in cell_contours if cv2.contourArea(c) > min_area]
+            # Find contours in the isolated cell to filter noise
+            cell_contours, _ = cv2.findContours(cell_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            valid_contours = [c for c in cell_contours if cv2.contourArea(c) > (cell_w * cell_h * 0.04)]
             
             status = "no symbol"
             text_color = (140, 140, 140) 
             
-            if len(valid_contours) > 0:
-                has_hole = False
-                if hierarchy is not None:
-                    for h_info in hierarchy[0]:
-                        if h_info[2] != -1: # Checks if the shape contains an internal empty space (like O)
-                            has_hole = True
-                            break
+            # Only classify if there's a strong visual presence of an object
+            if len(valid_contours) > 0 and fill_ratio > 0.06:
+                largest_symbol_contour = max(valid_contours, key=cv2.contourArea)
                 
-                if has_hole:
+                # Solidity calculation: contour area divided by its convex hull area
+                hull = cv2.convexHull(largest_symbol_contour)
+                hull_area = cv2.contourArea(hull)
+                solidity = cv2.contourArea(largest_symbol_contour) / hull_area if hull_area > 0 else 0
+                
+                # O is highly solid/filled circle, X has high hollow space/low solidity
+                if solidity > 0.68:
                     status = "O"
-                    text_color = (255, 110, 0) 
+                    text_color = (255, 110, 0) # Orange/Blue accent
                     count_o += 1
                 else:
                     status = "X"
-                    text_color = (0, 0, 255) 
+                    text_color = (0, 0, 255) # Red accent
                     count_x += 1
             else:
                 count_empty += 1
@@ -103,7 +106,7 @@ def process_and_draw_board(image_bytes):
             
     return output_img, status_logs, count_x, count_o, count_empty
 
-# --- Streamlit Layout Customization ---
+# --- Streamlit Presentation Layer ---
 st.set_page_config(page_title="CV Board Scanner Pro", page_icon="🤖", layout="wide")
 
 st.markdown("""
