@@ -12,11 +12,14 @@ def process_and_draw_board(image_bytes):
     output_img = img.copy()
     img_h, img_w = img.shape[:2]
     
-    # 1. Image Preprocessing
+    # 1. Edge-Based Preprocessing (Perfect for neon/glowing themes)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 4)
+    
+    # Using Canny Edges captures sharp symbol boundaries while discarding smooth glow gradients
+    edges = cv2.Canny(blurred, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    thresh = cv2.dilate(edges, kernel, iterations=1)
 
     # 2. Smart Boundary Detection
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -36,7 +39,10 @@ def process_and_draw_board(image_bytes):
     status_logs = []
     count_x, count_o, count_empty = 0, 0, 0
     
-    # 3. Process 3x3 Coordinate Matrix
+    # First pass: calculate total pixel densities to find true background noise levels
+    cell_densities = []
+    cell_data = []
+    
     for row in range(3):
         for col in range(3):
             start_x = x + (col * cell_w)
@@ -44,12 +50,9 @@ def process_and_draw_board(image_bytes):
             start_y = y + (row * cell_h)
             end_y = start_y + cell_h
             
-            # Draw cell boundaries
-            cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (34, 139, 34), 2)
-            
-            # Keep a tight 5% padding to maximize symbol detection space
-            pad_x = max(2, int(cell_w * 0.05))
-            pad_y = max(2, int(cell_h * 0.05))
+            # Shave 8% inside borders to completely discard cell line glows
+            pad_x = max(4, int(cell_w * 0.08))
+            pad_y = max(4, int(cell_h * 0.08))
             
             y1 = max(0, start_y + pad_y)
             y2 = min(img_h, end_y - pad_y)
@@ -57,59 +60,68 @@ def process_and_draw_board(image_bytes):
             x2 = min(img_w, end_x - pad_x)
             
             cell_thresh = thresh[y1:y2, x1:x2]
-            
-            # Count feature pixels
-            total_pixels = cell_thresh.size
             white_pixels = cv2.countNonZero(cell_thresh)
-            fill_ratio = white_pixels / total_pixels if total_pixels > 0 else 0
             
+            cell_densities.append(white_pixels)
+            cell_data.append(((row, col), start_x, end_x, start_y, end_y, cell_thresh))
+
+    # Dynamically separate true empty cell noise from symbols using a median threshold
+    max_density = max(cell_densities) if cell_densities else 1
+    
+    # 3. Process 3x3 Coordinate Matrix with dynamic thresholding
+    for item in cell_data:
+        (row, col), start_x, end_x, start_y, end_y, cell_thresh = item
+        white_pixels = cv2.countNonZero(cell_thresh)
+        
+        # Draw boundaries
+        cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (34, 139, 34), 2)
+        
+        status = "no symbol"
+        text_color = (140, 140, 140) 
+        
+        # An empty cell will have significantly fewer edge features than populated ones
+        if white_pixels < (max_density * 0.20) or white_pixels < 40:
+            status = "no symbol"
+            count_empty += 1
+        else:
             cell_contours, _ = cv2.findContours(cell_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            status = "no symbol"
-            text_color = (140, 140, 140) 
-            
-            # --- CRITICAL STAGE: Gatekeep True Empty Cells ---
-            # If there's barely any pixel activity, it's definitively empty.
-            if fill_ratio < 0.045: 
-                status = "no symbol"
-                count_empty += 1
-            else:
-                # Filter out minor speckles and small noise shapes
-                min_area = (cell_w * cell_h) * 0.03
-                valid_contours = [c for c in cell_contours if cv2.contourArea(c) > min_area]
+            if len(cell_contours) > 0:
+                target_contour = max(cell_contours, key=cv2.contourArea)
                 
-                if len(valid_contours) > 0:
-                    target_contour = max(valid_contours, key=cv2.contourArea)
-                    
-                    hull = cv2.convexHull(target_contour)
-                    hull_area = cv2.contourArea(hull)
-                    solidity = cv2.contourArea(target_contour) / hull_area if hull_area > 0 else 0
-                    
-                    # Split O's solid doughnut profile from X's sprawling cross profile
-                    if solidity > 0.65:
-                        status = "O"
-                        text_color = (255, 110, 0) 
-                        count_o += 1
-                    else:
-                        status = "X"
-                        text_color = (0, 0, 255) 
-                        count_x += 1
+                hull = cv2.convexHull(target_contour)
+                hull_area = cv2.contourArea(hull)
+                solidity = cv2.contourArea(target_contour) / hull_area if hull_area > 0 else 0
+                
+                # Check aspect ratio to double-verify straight/round objects
+                _, _, cw, ch = cv2.boundingRect(target_contour)
+                aspect_ratio = float(cw) / ch if ch > 0 else 1.0
+                
+                # O is perfectly circular/enclosed (high solidity), X spans out diagonally (low solidity)
+                if solidity > 0.60 and (0.75 <= aspect_ratio <= 1.35):
+                    status = "O"
+                    text_color = (255, 110, 0) 
+                    count_o += 1
                 else:
-                    count_empty += 1
-            
-            status_logs.append(f"At position ({row},{col}) there is {status}")
-            
-            display_text = "Empty" if status == "no symbol" else status
-            text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_DUPLEX, 0.6, 2)[0]
-            
-            center_x = start_x + (cell_w - text_size[0]) // 2
-            center_y = start_y + (cell_h + text_size[1]) // 2
-            cv2.putText(output_img, display_text, (center_x, center_y), 
-                        cv2.FONT_HERSHEY_DUPLEX, 0.6, text_color, 2)
+                    status = "X"
+                    text_color = (0, 0, 255) 
+                    count_x += 1
+            else:
+                count_empty += 1
+        
+        status_logs.append(f"At position ({row},{col}) there is {status}")
+        
+        display_text = "Empty" if status == "no symbol" else status
+        text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_DUPLEX, 0.6, 2)[0]
+        
+        center_x = start_x + (cell_w - text_size[0]) // 2
+        center_y = start_y + (cell_h + text_size[1]) // 2
+        cv2.putText(output_img, display_text, (center_x, center_y), 
+                    cv2.FONT_HERSHEY_DUPLEX, 0.6, text_color, 2)
             
     return output_img, status_logs, count_x, count_o, count_empty
 
-# --- Streamlit Presentation View Window ---
+# --- Streamlit Layout ---
 st.set_page_config(page_title="CV Board Scanner Pro", page_icon="🤖", layout="wide")
 
 st.markdown("""
@@ -120,7 +132,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🤖 Computer Vision Tic-Tac-Toe Analyzer")
-st.write("An advanced image processing engine mapping $3 \\times 3$ matrices using structural contour validation.")
+st.write("An advanced image processing engine mapping $3 \\times 3$ matrices using edge-based structural validation.")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 1], gap="large")
