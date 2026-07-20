@@ -2,50 +2,6 @@ import cv2
 import numpy as np
 import streamlit as st
 
-def detect_board_corners(img):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 4)
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    img_h, img_w = img.shape[:2]
-    
-    possible_grids = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if (img_w * img_h * 0.10) < area < (img_w * img_h * 0.85):
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.03 * peri, True)
-            if len(approx) == 4:
-                possible_grids.append((area, approx))
-                
-    if possible_grids:
-        possible_grids.sort(key=lambda x: x[0], reverse=True)
-        pts = possible_grids[0][1].reshape(4, 2)
-        return order_points(pts)
-        
-    margin_w = int(img_w * 0.15)
-    margin_h = int(img_h * 0.15)
-    pts = np.array([
-        [margin_w, margin_h],
-        [img_w - margin_w, margin_h],
-        [img_w - margin_w, img_h - margin_h],
-        [margin_w, img_h - margin_h]
-    ], dtype="float32")
-    return pts
-
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
 def process_and_draw_board(image_bytes):
     file_bytes = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -53,78 +9,114 @@ def process_and_draw_board(image_bytes):
     if img is None:
         return None, ["Error reading image format."], 0, 0, 0
         
-    corners = detect_board_corners(img)
+    output_img = img.copy()
+    img_h, img_w = img.shape[:2]
     
-    board_size = 600
-    dst_pts = np.array([
-        [0, 0],
-        [board_size - 1, 0],
-        [board_size - 1, board_size - 1],
-        [0, board_size - 1]
-    ], dtype="float32")
+    # 1. Image Preprocessing
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    M = cv2.getPerspectiveTransform(corners, dst_pts)
-    warped = cv2.warpPerspective(img, M, (board_size, board_size))
-    
-    output_img = warped.copy()
-    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+    # Adaptive thresholding to find the drawn square outline
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 15, 4)
 
+    # 2. Find the exact 5x5 board boundary line
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Default fallback: scan central region if contour isn't isolated
+    x, y, w, h = int(img_w * 0.18), int(img_h * 0.05), int(img_w * 0.65), int(img_h * 0.88)
+    
+    valid_squares = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if (img_w * img_h * 0.15) < area < (img_w * img_h * 0.80):
+            bx, by, bw, bh = cv2.boundingRect(c)
+            aspect_ratio = float(bw) / bh if bh > 0 else 0
+            if 0.75 <= aspect_ratio <= 1.25: # Square-like profile
+                valid_squares.append((area, bx, by, bw, bh))
+                
+    if valid_squares:
+        valid_squares.sort(key=lambda item: item[0], reverse=True)
+        _, x, y, w, h = valid_squares[0]
+
+    # Draw main outer 5x5 grid bounding box in red
+    cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 0, 255), 4)
+
+    # 3. Calculate 5x5 Matrix Cell Dimensions
     GRID_SIZE = 5
-    cell_dim = board_size // GRID_SIZE
+    cell_w = w // GRID_SIZE
+    cell_h = h // GRID_SIZE
     
     status_logs = []
     count_red, count_blue, count_empty = 0, 0, 0
     
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # 4. Iterate strictly through 5x5 Cells
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
-            start_x = col * cell_dim
-            end_x = start_x + cell_dim
-            start_y = row * cell_dim
-            end_y = start_y + cell_dim
+            start_x = x + (col * cell_w)
+            end_x = start_x + cell_w
+            start_y = y + (row * cell_h)
+            end_y = start_y + cell_h
             
+            # Draw individual cell boundary in bright green
             cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 2)
             
-            # Use 15% padding so we catch tokens that sit slightly off-center
-            pad = int(cell_dim * 0.15)
-            cell_hsv = hsv[start_y + pad:end_y - pad, start_x + pad:end_x - pad]
+            # Crop the inner core (15% padding) to analyze center of the hole/token
+            pad_x = int(cell_w * 0.15)
+            pad_y = int(cell_h * 0.15)
+            
+            y1 = max(0, start_y + pad_y)
+            y2 = min(img_h, end_y - pad_y)
+            x1 = max(0, start_x + pad_x)
+            x2 = min(img_w, end_x - pad_x)
+            
+            cell_hsv = hsv[y1:y2, x1:x2]
             
             if cell_hsv.size == 0:
                 continue
 
-            # --- EXPANDED HSV RANGES ---
-            # Red Range (Broadened for lighting variations)
-            lower_red1 = np.array([0, 50, 40])
+            # --- COLOR RANGE DEFINITIONS ---
+            # Red Token Range
+            lower_red1 = np.array([0, 60, 50])
             upper_red1 = np.array([15, 255, 255])
-            lower_red2 = np.array([155, 50, 40])
+            lower_red2 = np.array([155, 60, 50])
             upper_red2 = np.array([180, 255, 255])
             
-            # Blue Range (Lowered S and V thresholds to detect shadowed blue tokens)
-            lower_blue = np.array([85, 40, 30])
+            # Blue Token Range
+            lower_blue = np.array([85, 50, 30])
             upper_blue = np.array([140, 255, 255])
+
+            # Green Empty Hole Range
+            lower_green = np.array([35, 40, 40])
+            upper_green = np.array([85, 255, 255])
 
             mask_r1 = cv2.inRange(cell_hsv, lower_red1, upper_red1)
             mask_r2 = cv2.inRange(cell_hsv, lower_red2, upper_red2)
             mask_red = cv2.bitwise_or(mask_r1, mask_r2)
             
             mask_blue = cv2.inRange(cell_hsv, lower_blue, upper_blue)
+            mask_green = cv2.inRange(cell_hsv, lower_green, upper_green)
 
-            red_count = cv2.countNonZero(mask_red)
-            blue_count = cv2.countNonZero(mask_blue)
+            red_pixels = cv2.countNonZero(mask_red)
+            blue_pixels = cv2.countNonZero(mask_blue)
+            green_pixels = cv2.countNonZero(mask_green)
+            
             total_pixels = cell_hsv.shape[0] * cell_hsv.shape[1]
+            min_threshold = total_pixels * 0.10
 
             status = "no symbol"
-            text_color = (140, 140, 140) 
-            
-            # Lowered threshold to 10% area coverage
-            min_pixels = total_pixels * 0.10
+            text_color = (140, 140, 140) # Grey for Empty
 
-            if red_count > min_pixels and red_count >= blue_count:
+            # Classification Logic
+            if red_pixels > min_threshold and red_pixels > blue_pixels and red_pixels > green_pixels:
                 status = "Red"
-                text_color = (0, 0, 255) 
+                text_color = (0, 0, 255) # Red
                 count_red += 1
-            elif blue_count > min_pixels and blue_count > red_count:
+            elif blue_pixels > min_threshold and blue_pixels > red_pixels and blue_pixels > green_pixels:
                 status = "Blue"
-                text_color = (255, 100, 0) 
+                text_color = (255, 100, 0) # Blue
                 count_blue += 1
             else:
                 status = "no symbol"
@@ -132,13 +124,14 @@ def process_and_draw_board(image_bytes):
 
             status_logs.append(f"At position ({row},{col}) there is {status}")
             
+            # Format text overlay
             display_text = "Empty" if status == "no symbol" else status
-            font_scale = 0.65
+            font_scale = 0.6
             thickness = 2
             
             text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)[0]
-            cx = start_x + (cell_dim - text_size[0]) // 2
-            cy = start_y + (cell_dim + text_size[1]) // 2
+            cx = start_x + (cell_w - text_size[0]) // 2
+            cy = start_y + (cell_h + text_size[1]) // 2
             
             cv2.putText(output_img, display_text, (cx, cy), 
                         cv2.FONT_HERSHEY_DUPLEX, font_scale, text_color, thickness)
@@ -181,9 +174,9 @@ if uploaded_file is not None:
 
 with col2:
     if uploaded_file is not None and processed_image is not None:
-        st.subheader("🖼️ Cropped 5x5 Grid Scan Map")
+        st.subheader("🖼️ Target 5x5 Grid Scan Map")
         processed_image_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
-        st.image(processed_image_rgb, use_container_width=True, caption="Perspective-Corrected 5x5 Matrix")
+        st.image(processed_image_rgb, use_container_width=True, caption="5x5 Matrix Scan Map")
         
         st.subheader("📋 Parsed Coordinate Logs (0 to 4)")
         st.code("\n".join(logs), language="text")
