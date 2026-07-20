@@ -3,22 +3,14 @@ import numpy as np
 import streamlit as st
 
 def detect_board_corners(img):
-    """
-    Finds the 4 corner marks of the 5x5 playing grid.
-    If automatic detection fails, falls back to bounding the primary grid area.
-    """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Adaptive thresholding to pick up the grid outline and corner markers
     thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 15, 4)
     
     contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
     img_h, img_w = img.shape[:2]
     
-    # Look for square-like contour corresponding to the grid boundary
     possible_grids = []
     for c in contours:
         area = cv2.contourArea(c)
@@ -29,12 +21,10 @@ def detect_board_corners(img):
                 possible_grids.append((area, approx))
                 
     if possible_grids:
-        # Pick the best matching square contour
         possible_grids.sort(key=lambda x: x[0], reverse=True)
         pts = possible_grids[0][1].reshape(4, 2)
         return order_points(pts)
         
-    # Fallback: crop the center region where the 5x5 board sits
     margin_w = int(img_w * 0.15)
     margin_h = int(img_h * 0.15)
     pts = np.array([
@@ -46,7 +36,6 @@ def detect_board_corners(img):
     return pts
 
 def order_points(pts):
-    """Orders coordinates: top-left, top-right, bottom-right, bottom-left"""
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
     rect[0] = pts[np.argmin(s)]
@@ -64,10 +53,8 @@ def process_and_draw_board(image_bytes):
     if img is None:
         return None, ["Error reading image format."], 0, 0, 0
         
-    # 1. Get exact 4 corners of the 5x5 playing grid
     corners = detect_board_corners(img)
     
-    # 2. Warp Perspective to get a perfectly flat, clean 500x500 square image
     board_size = 600
     dst_pts = np.array([
         [0, 0],
@@ -82,7 +69,6 @@ def process_and_draw_board(image_bytes):
     output_img = warped.copy()
     hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
 
-    # 3. Process exactly 5x5 cells inside the warped grid ONLY
     GRID_SIZE = 5
     cell_dim = board_size // GRID_SIZE
     
@@ -96,26 +82,25 @@ def process_and_draw_board(image_bytes):
             start_y = row * cell_dim
             end_y = start_y + cell_dim
             
-            # Draw green cell boundary strictly inside 5x5 board
             cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 2)
             
-            # Crop the inner core of the cell (shave 25% off edges to focus on token top surface)
-            pad = int(cell_dim * 0.25)
+            # Use 15% padding so we catch tokens that sit slightly off-center
+            pad = int(cell_dim * 0.15)
             cell_hsv = hsv[start_y + pad:end_y - pad, start_x + pad:end_x - pad]
             
             if cell_hsv.size == 0:
                 continue
 
-            # --- HSV Color Ranges for 3D Red and Blue Tokens ---
-            # Red token range (handles lighting reflections on top surface)
-            lower_red1 = np.array([0, 90, 60])
-            upper_red1 = np.array([12, 255, 255])
-            lower_red2 = np.array([160, 90, 60])
+            # --- EXPANDED HSV RANGES ---
+            # Red Range (Broadened for lighting variations)
+            lower_red1 = np.array([0, 50, 40])
+            upper_red1 = np.array([15, 255, 255])
+            lower_red2 = np.array([155, 50, 40])
             upper_red2 = np.array([180, 255, 255])
             
-            # Blue token range
-            lower_blue = np.array([95, 90, 60])
-            upper_blue = np.array([135, 255, 255])
+            # Blue Range (Lowered S and V thresholds to detect shadowed blue tokens)
+            lower_blue = np.array([85, 40, 30])
+            upper_blue = np.array([140, 255, 255])
 
             mask_r1 = cv2.inRange(cell_hsv, lower_red1, upper_red1)
             mask_r2 = cv2.inRange(cell_hsv, lower_red2, upper_red2)
@@ -128,18 +113,18 @@ def process_and_draw_board(image_bytes):
             total_pixels = cell_hsv.shape[0] * cell_hsv.shape[1]
 
             status = "no symbol"
-            text_color = (140, 140, 140) # Grey for empty
+            text_color = (140, 140, 140) 
             
-            # Must cover at least 15% of the inner core with red or blue color
-            min_pixels = total_pixels * 0.15
+            # Lowered threshold to 10% area coverage
+            min_pixels = total_pixels * 0.10
 
-            if red_count > min_pixels and red_count > blue_count:
+            if red_count > min_pixels and red_count >= blue_count:
                 status = "Red"
-                text_color = (0, 0, 255) # Red text
+                text_color = (0, 0, 255) 
                 count_red += 1
             elif blue_count > min_pixels and blue_count > red_count:
                 status = "Blue"
-                text_color = (255, 100, 0) # Blue text
+                text_color = (255, 100, 0) 
                 count_blue += 1
             else:
                 status = "no symbol"
@@ -147,7 +132,6 @@ def process_and_draw_board(image_bytes):
 
             status_logs.append(f"At position ({row},{col}) there is {status}")
             
-            # Text overlay on cell center
             display_text = "Empty" if status == "no symbol" else status
             font_scale = 0.65
             thickness = 2
@@ -161,7 +145,7 @@ def process_and_draw_board(image_bytes):
             
     return output_img, status_logs, count_red, count_blue, count_empty
 
-# --- Streamlit Frontend ---
+# --- Streamlit Layout ---
 st.set_page_config(page_title="5x5 Robot Board Scanner", page_icon="🤖", layout="wide")
 
 st.markdown("""
