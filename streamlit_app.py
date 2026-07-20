@@ -17,62 +17,61 @@ def order_corner_points(pts):
     rect[3] = pts[np.argmax(diff)] # Bottom-Left has largest difference
     return rect
 
-def get_warped_board(img):
+def extract_5x5_board(img):
     """
-    Detects the 4 corner marker dots on the drawn 5x5 outline 
-    and applies a Perspective Transform to align the grid perfectly.
+    Locates the 4 small corner anchor holes of the drawn 5x5 grid 
+    and applies a perspective warp to isolate strictly the 5x5 play zone.
     """
     img_h, img_w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Adaptive thresholding to isolate small dark marker holes
+    # Adaptive thresholding to isolate small dark circular corner holes
     thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                    cv2.THRESH_BINARY_INV, 15, 5)
 
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Look for the small corner marker dots
     marker_centers = []
     for c in contours:
         area = cv2.contourArea(c)
-        # Filter for small dot sizes relative to overall image resolution
-        if (img_w * img_h * 0.0001) < area < (img_w * img_h * 0.008):
+        # Filter strictly for small dot dimensions relative to image resolution
+        if (img_w * img_h * 0.00005) < area < (img_w * img_h * 0.005):
             peri = cv2.arcLength(c, True)
             if peri > 0:
                 circularity = 4 * np.pi * (area / (peri * peri))
-                if circularity > 0.55: # Circle shape check
+                if circularity > 0.60: # High circularity for the corner holes
                     M = cv2.moments(c)
                     if M["m00"] != 0:
                         cX = int(M["m10"] / M["m00"])
                         cY = int(M["m01"] / M["m00"])
                         marker_centers.append([cX, cY])
 
-    # If 4 or more corner markers are found, build the exact bounding rectangle
+    # If 4 or more corner anchor points are detected
     if len(marker_centers) >= 4:
         pts = np.array(marker_centers, dtype="float32")
-        # Find the convex hull of the dots to grab the 4 extreme outer corner points
+        # Get the convex hull to pull the 4 extreme outer corner points
         hull = cv2.convexHull(pts)
-        if len(hull) >= 4:
-            peri = cv2.arcLength(hull, True)
-            approx = cv2.approxPolyDP(hull, 0.08 * peri, True)
-            if len(approx) == 4:
-                ordered_pts = order_corner_points(approx.reshape(4, 2))
-                
-                # Perform 500x500 Perspective Warp
-                target_size = 500
-                dst_pts = np.array([
-                    [0, 0],
-                    [target_size - 1, 0],
-                    [target_size - 1, target_size - 1],
-                    [0, target_size - 1]
-                ], dtype="float32")
-                
-                M = cv2.getPerspectiveTransform(ordered_pts, dst_pts)
-                warped = cv2.warpPerspective(img, M, (target_size, target_size))
-                return warped, True
+        peri = cv2.arcLength(hull, True)
+        approx = cv2.approxPolyDP(hull, 0.08 * peri, True)
+        
+        if len(approx) == 4:
+            ordered_pts = order_corner_points(approx.reshape(4, 2))
+            
+            # Warp perspective to a clean, flat 500x500 square
+            target_size = 500
+            dst_pts = np.array([
+                [0, 0],
+                [target_size - 1, 0],
+                [target_size - 1, target_size - 1],
+                [0, target_size - 1]
+            ], dtype="float32")
+            
+            M = cv2.getPerspectiveTransform(ordered_pts, dst_pts)
+            warped = cv2.warpPerspective(img, M, (target_size, target_size))
+            return warped, True
 
-    # Fallback: Crop based on square contour fallback if markers are partially occluded
+    # Fallback: Square contour bounded fallback if corner dots are occluded
     square_candidates = []
     for c in contours:
         area = cv2.contourArea(c)
@@ -88,7 +87,7 @@ def get_warped_board(img):
         cropped = img[y:y+h, x:x+w]
         return cv2.resize(cropped, (500, 500)), False
 
-    # Proportional fallback crop
+    # Proportional dynamic fallback crop
     margin_w = int(img_w * 0.18)
     margin_h = int(img_h * 0.18)
     cropped = img[margin_h:img_h - margin_h, margin_w:img_w - margin_w]
@@ -101,8 +100,8 @@ def process_and_draw_board(image_bytes):
     if img is None:
         return None, ["Error reading image format."], 0, 0, 0
         
-    # 1. Transform and align the 5x5 board into a clean 500x500 square canvas
-    board_img, is_warped = get_warped_board(img)
+    # 1. Warp perspective strictly based on the 4 corner marker holes
+    board_img, is_warped = extract_5x5_board(img)
     output_img = board_img.copy()
     
     board_size = 500
@@ -114,7 +113,7 @@ def process_and_draw_board(image_bytes):
     
     hsv = cv2.cvtColor(board_img, cv2.COLOR_BGR2HSV)
 
-    # 2. Iterate strictly across the 5x5 normalized matrix
+    # 2. Iterate through the normalized 5x5 grid
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
             start_x = col * cell_dim
@@ -122,25 +121,25 @@ def process_and_draw_board(image_bytes):
             start_y = row * cell_dim
             end_y = start_y + cell_dim
             
-            # Draw green cell boundaries
+            # Draw green box for individual cell boundary
             cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 2)
             
-            # Crop 22% inner core to avoid border edges
-            pad = int(cell_dim * 0.22)
+            # Sample central 50% core of each hole to avoid rim edge interference
+            pad = int(cell_dim * 0.25)
             cell_hsv = hsv[start_y + pad:end_y - pad, start_x + pad:end_x - pad]
             
             if cell_hsv.size == 0:
                 continue
 
             # --- COLOR SEGMENTATION (HSV) ---
-            # Red token range (handles hue wrap)
-            lower_red1 = np.array([0, 60, 40])
+            # Red 3D Token Range (handles hue wrap around 0 / 180 degrees)
+            lower_red1 = np.array([0, 50, 40])
             upper_red1 = np.array([15, 255, 255])
-            lower_red2 = np.array([155, 60, 40])
+            lower_red2 = np.array([155, 50, 40])
             upper_red2 = np.array([180, 255, 255])
             
-            # Blue token range (lowered S/V floor to pick up shadowed blue tokens)
-            lower_blue = np.array([85, 45, 30])
+            # Blue 3D Token Range (lowered S/V floor for deep/shadowed holes)
+            lower_blue = np.array([85, 40, 25])
             upper_blue = np.array([140, 255, 255])
 
             mask_r1 = cv2.inRange(cell_hsv, lower_red1, upper_red1)
@@ -153,9 +152,9 @@ def process_and_draw_board(image_bytes):
             total_pixels = cell_hsv.shape[0] * cell_hsv.shape[1]
 
             status = "no symbol"
-            text_color = (160, 160, 160) # Grey for empty
+            text_color = (160, 160, 160) # Grey for Empty
             
-            min_threshold = total_pixels * 0.12
+            min_threshold = total_pixels * 0.10
 
             if red_pixels > min_threshold and red_pixels >= blue_pixels:
                 status = "Red"
@@ -173,7 +172,7 @@ def process_and_draw_board(image_bytes):
             
             # --- PROMINENT, BOLD TEXT OVERLAY ---
             display_text = "EMPTY" if status == "no symbol" else status
-            font_scale = 0.75
+            font_scale = 0.70
             thickness = 2
             
             text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)[0]
@@ -196,7 +195,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🤖 5x5 Robot Board Matrix Scanner")
-st.write("Perspective-corrected $5 \\times 5$ matrix scanner driven by corner anchor dot detection.")
+st.write("Perspective-corrected $5 \\times 5$ matrix scanner anchored directly to corner marker dots.")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 1], gap="large")
