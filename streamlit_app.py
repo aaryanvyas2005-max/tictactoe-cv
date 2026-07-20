@@ -2,6 +2,43 @@ import cv2
 import numpy as np
 import streamlit as st
 
+def get_exact_board_crop(img):
+    """
+    Locates the precise 5x5 drawn black square outline on the physical board.
+    """
+    img_h, img_w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Adaptive thresholding to pick up dark drawn lines and corner dots
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY_INV, 15, 4)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    square_candidates = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        # Look for a square covering between 10% and 75% of the total image
+        if (img_w * img_h * 0.10) < area < (img_w * img_h * 0.75):
+            x, y, w, h = cv2.boundingRect(c)
+            aspect_ratio = float(w) / h if h > 0 else 0
+            if 0.80 <= aspect_ratio <= 1.20:  # Must be square-like
+                square_candidates.append((area, x, y, w, h))
+
+    if square_candidates:
+        # Pick the largest square contour matching the drawn boundary
+        square_candidates.sort(key=lambda item: item[0], reverse=True)
+        _, x, y, w, h = square_candidates[0]
+        return x, y, w, h
+
+    # Hardcoded fallback relative coordinates based on camera framing
+    x = int(img_w * 0.19)
+    y = int(img_h * 0.36)
+    w = int(img_w * 0.50)
+    h = int(img_h * 0.50)
+    return x, y, w, h
+
 def process_and_draw_board(image_bytes):
     file_bytes = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -11,38 +48,14 @@ def process_and_draw_board(image_bytes):
         
     output_img = img.copy()
     img_h, img_w = img.shape[:2]
-    
-    # 1. Image Preprocessing
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Adaptive thresholding to find the drawn square outline
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 4)
 
-    # 2. Find the exact 5x5 board boundary line
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    # 1. Locate the exact 5x5 square boundary
+    x, y, w, h = get_exact_board_crop(img)
     
-    # Default fallback: scan central region if contour isn't isolated
-    x, y, w, h = int(img_w * 0.18), int(img_h * 0.05), int(img_w * 0.65), int(img_h * 0.88)
-    
-    valid_squares = []
-    for c in contours:
-        area = cv2.contourArea(c)
-        if (img_w * img_h * 0.15) < area < (img_w * img_h * 0.80):
-            bx, by, bw, bh = cv2.boundingRect(c)
-            aspect_ratio = float(bw) / bh if bh > 0 else 0
-            if 0.75 <= aspect_ratio <= 1.25: # Square-like profile
-                valid_squares.append((area, bx, by, bw, bh))
-                
-    if valid_squares:
-        valid_squares.sort(key=lambda item: item[0], reverse=True)
-        _, x, y, w, h = valid_squares[0]
+    # Draw thick red boundary around the isolated 5x5 board
+    cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 0, 255), 5)
 
-    # Draw main outer 5x5 grid bounding box in red
-    cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 0, 255), 4)
-
-    # 3. Calculate 5x5 Matrix Cell Dimensions
+    # 2. Divide strictly into 5x5 grid cells
     GRID_SIZE = 5
     cell_w = w // GRID_SIZE
     cell_h = h // GRID_SIZE
@@ -50,9 +63,7 @@ def process_and_draw_board(image_bytes):
     status_logs = []
     count_red, count_blue, count_empty = 0, 0, 0
     
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-    # 4. Iterate strictly through 5x5 Cells
+    # 3. Analyze each cell using BGR & HSV color values
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
             start_x = x + (col * cell_w)
@@ -60,63 +71,41 @@ def process_and_draw_board(image_bytes):
             start_y = y + (row * cell_h)
             end_y = start_y + cell_h
             
-            # Draw individual cell boundary in bright green
-            cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 2)
+            # Draw green cell grid
+            cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 3)
             
-            # Crop the inner core (15% padding) to analyze center of the hole/token
-            pad_x = int(cell_w * 0.15)
-            pad_y = int(cell_h * 0.15)
+            # Center sampling core (20% padding)
+            pad_x = int(cell_w * 0.20)
+            pad_y = int(cell_h * 0.20)
             
             y1 = max(0, start_y + pad_y)
             y2 = min(img_h, end_y - pad_y)
             x1 = max(0, start_x + pad_x)
             x2 = min(img_w, end_x - pad_x)
             
-            cell_hsv = hsv[y1:y2, x1:x2]
+            cell_bgr = img[y1:y2, x1:x2]
             
-            if cell_hsv.size == 0:
+            if cell_bgr.size == 0:
                 continue
 
-            # --- COLOR RANGE DEFINITIONS ---
-            # Red Token Range
-            lower_red1 = np.array([0, 60, 50])
-            upper_red1 = np.array([15, 255, 255])
-            lower_red2 = np.array([155, 60, 50])
-            upper_red2 = np.array([180, 255, 255])
-            
-            # Blue Token Range
-            lower_blue = np.array([85, 50, 30])
-            upper_blue = np.array([140, 255, 255])
-
-            # Green Empty Hole Range
-            lower_green = np.array([35, 40, 40])
-            upper_green = np.array([85, 255, 255])
-
-            mask_r1 = cv2.inRange(cell_hsv, lower_red1, upper_red1)
-            mask_r2 = cv2.inRange(cell_hsv, lower_red2, upper_red2)
-            mask_red = cv2.bitwise_or(mask_r1, mask_r2)
-            
-            mask_blue = cv2.inRange(cell_hsv, lower_blue, upper_blue)
-            mask_green = cv2.inRange(cell_hsv, lower_green, upper_green)
-
-            red_pixels = cv2.countNonZero(mask_red)
-            blue_pixels = cv2.countNonZero(mask_blue)
-            green_pixels = cv2.countNonZero(mask_green)
-            
-            total_pixels = cell_hsv.shape[0] * cell_hsv.shape[1]
-            min_threshold = total_pixels * 0.10
+            # Average BGR color values inside the hole core
+            avg_b = np.mean(cell_bgr[:, :, 0])
+            avg_g = np.mean(cell_bgr[:, :, 1])
+            avg_r = np.mean(cell_bgr[:, :, 2])
 
             status = "no symbol"
-            text_color = (140, 140, 140) # Grey for Empty
-
-            # Classification Logic
-            if red_pixels > min_threshold and red_pixels > blue_pixels and red_pixels > green_pixels:
+            text_color = (160, 160, 160) # Bold Grey for Empty
+            
+            # --- STRICT BGR COLOR DISCRIMINATION ---
+            # Red 3D Token: Red channel dominant over Blue and Green
+            if avg_r > (avg_g * 1.35) and avg_r > (avg_b * 1.35) and avg_r > 70:
                 status = "Red"
-                text_color = (0, 0, 255) # Red
+                text_color = (0, 0, 255) # Bright Red
                 count_red += 1
-            elif blue_pixels > min_threshold and blue_pixels > red_pixels and blue_pixels > green_pixels:
+            # Blue 3D Token: Blue channel dominant over Red and Green
+            elif avg_b > (avg_r * 1.25) and avg_b > (avg_g * 1.10) and avg_b > 60:
                 status = "Blue"
-                text_color = (255, 100, 0) # Blue
+                text_color = (255, 120, 0) # Bright Blue
                 count_blue += 1
             else:
                 status = "no symbol"
@@ -124,10 +113,12 @@ def process_and_draw_board(image_bytes):
 
             status_logs.append(f"At position ({row},{col}) there is {status}")
             
-            # Format text overlay
-            display_text = "Empty" if status == "no symbol" else status
-            font_scale = 0.6
-            thickness = 2
+            # --- LARGE, BOLD TEXT OVERLAY ---
+            display_text = "EMPTY" if status == "no symbol" else status
+            
+            # Font size dynamically scaled to cell size
+            font_scale = max(0.8, cell_w / 90.0)
+            thickness = 3
             
             text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)[0]
             cx = start_x + (cell_w - text_size[0]) // 2
@@ -138,7 +129,7 @@ def process_and_draw_board(image_bytes):
             
     return output_img, status_logs, count_red, count_blue, count_empty
 
-# --- Streamlit Layout ---
+# --- Streamlit Presentation Layer ---
 st.set_page_config(page_title="5x5 Robot Board Scanner", page_icon="🤖", layout="wide")
 
 st.markdown("""
@@ -148,18 +139,18 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🤖 5x5 Color Token Matrix Scanner")
-st.write("Strict $5 \\times 5$ grid detection isolating 3D Red and Blue tokens from empty board slots.")
+st.title("🤖 5x5 Robot Board Matrix Scanner")
+st.write("Strict $5 \\times 5$ grid classification for 3D Red and Blue tokens.")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
     st.subheader("📷 Input Node")
-    uploaded_file = st.file_uploader("Upload 5x5 robot board photo:", type=["jpg", "jpeg", "png"])
+    uploaded_file = st.file_uploader("Upload 5x5 board snapshot:", type=["jpg", "jpeg", "png"])
     
     if uploaded_file is None:
-        st.info("💡 Awaiting 5x5 board image upload...")
+        st.info("💡 Awaiting image upload...")
 
 if uploaded_file is not None:
     img_bytes = uploaded_file.read()
@@ -176,7 +167,7 @@ with col2:
     if uploaded_file is not None and processed_image is not None:
         st.subheader("🖼️ Target 5x5 Grid Scan Map")
         processed_image_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
-        st.image(processed_image_rgb, use_container_width=True, caption="5x5 Matrix Scan Map")
+        st.image(processed_image_rgb, use_container_width=True, caption="5x5 Matrix Grid Scan")
         
         st.subheader("📋 Parsed Coordinate Logs (0 to 4)")
         st.code("\n".join(logs), language="text")
