@@ -2,41 +2,97 @@ import cv2
 import numpy as np
 import streamlit as st
 
-def detect_and_crop_grid(img):
+def order_corner_points(pts):
     """
-    Locates the inner 5x5 drawn square boundary regardless of image orientation.
+    Orders 4 points into Top-Left, Top-Right, Bottom-Right, Bottom-Left order
+    regardless of image rotation (0, 90, 180, or 270 degrees).
+    """
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)] # Top-Left has smallest sum
+    rect[2] = pts[np.argmax(s)] # Bottom-Right has largest sum
+
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)] # Top-Right has smallest difference
+    rect[3] = pts[np.argmax(diff)] # Bottom-Left has largest difference
+    return rect
+
+def get_warped_board(img):
+    """
+    Detects the 4 corner marker dots on the drawn 5x5 outline 
+    and applies a Perspective Transform to align the grid perfectly.
     """
     img_h, img_w = img.shape[:2]
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    # Adaptive thresholding to pick up the drawn black grid lines
+    # Adaptive thresholding to isolate small dark marker holes
     thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 4)
+                                   cv2.THRESH_BINARY_INV, 15, 5)
 
-    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
+    # Look for the small corner marker dots
+    marker_centers = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        # Filter for small dot sizes relative to overall image resolution
+        if (img_w * img_h * 0.0001) < area < (img_w * img_h * 0.008):
+            peri = cv2.arcLength(c, True)
+            if peri > 0:
+                circularity = 4 * np.pi * (area / (peri * peri))
+                if circularity > 0.55: # Circle shape check
+                    M = cv2.moments(c)
+                    if M["m00"] != 0:
+                        cX = int(M["m10"] / M["m00"])
+                        cY = int(M["m01"] / M["m00"])
+                        marker_centers.append([cX, cY])
+
+    # If 4 or more corner markers are found, build the exact bounding rectangle
+    if len(marker_centers) >= 4:
+        pts = np.array(marker_centers, dtype="float32")
+        # Find the convex hull of the dots to grab the 4 extreme outer corner points
+        hull = cv2.convexHull(pts)
+        if len(hull) >= 4:
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.08 * peri, True)
+            if len(approx) == 4:
+                ordered_pts = order_corner_points(approx.reshape(4, 2))
+                
+                # Perform 500x500 Perspective Warp
+                target_size = 500
+                dst_pts = np.array([
+                    [0, 0],
+                    [target_size - 1, 0],
+                    [target_size - 1, target_size - 1],
+                    [0, target_size - 1]
+                ], dtype="float32")
+                
+                M = cv2.getPerspectiveTransform(ordered_pts, dst_pts)
+                warped = cv2.warpPerspective(img, M, (target_size, target_size))
+                return warped, True
+
+    # Fallback: Crop based on square contour fallback if markers are partially occluded
     square_candidates = []
     for c in contours:
         area = cv2.contourArea(c)
-        # Target square must cover between 12% and 80% of the image canvas
-        if (img_w * img_h * 0.12) < area < (img_w * img_h * 0.80):
+        if (img_w * img_h * 0.15) < area < (img_w * img_h * 0.80):
             x, y, w, h = cv2.boundingRect(c)
             aspect_ratio = float(w) / h if h > 0 else 0
-            if 0.75 <= aspect_ratio <= 1.25: # Square profile check
+            if 0.80 <= aspect_ratio <= 1.20:
                 square_candidates.append((area, x, y, w, h))
 
     if square_candidates:
         square_candidates.sort(key=lambda item: item[0], reverse=True)
         _, x, y, w, h = square_candidates[0]
-        return x, y, w, h
+        cropped = img[y:y+h, x:x+w]
+        return cv2.resize(cropped, (500, 500)), False
 
-    # Dynamic fallback proportional to board geometry
-    x = int(img_w * 0.18)
-    y = int(img_h * 0.18)
-    w = int(img_w * 0.64)
-    h = int(img_h * 0.64)
-    return x, y, w, h
+    # Proportional fallback crop
+    margin_w = int(img_w * 0.18)
+    margin_h = int(img_h * 0.18)
+    cropped = img[margin_h:img_h - margin_h, margin_w:img_w - margin_w]
+    return cv2.resize(cropped, (500, 500)), False
 
 def process_and_draw_board(image_bytes):
     file_bytes = np.frombuffer(image_bytes, np.uint8)
@@ -45,60 +101,46 @@ def process_and_draw_board(image_bytes):
     if img is None:
         return None, ["Error reading image format."], 0, 0, 0
         
-    output_img = img.copy()
-    img_h, img_w = img.shape[:2]
-
-    # 1. Locate the exact 5x5 grid bounding box
-    x, y, w, h = detect_and_crop_grid(img)
+    # 1. Transform and align the 5x5 board into a clean 500x500 square canvas
+    board_img, is_warped = get_warped_board(img)
+    output_img = board_img.copy()
     
-    # Draw thick red boundary around detected 5x5 board
-    cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 0, 255), 5)
-
-    # 2. Divide into 5x5 grid cells
+    board_size = 500
     GRID_SIZE = 5
-    cell_w = w // GRID_SIZE
-    cell_h = h // GRID_SIZE
+    cell_dim = board_size // GRID_SIZE
     
     status_logs = []
     count_red, count_blue, count_empty = 0, 0, 0
     
-    # Convert image to HSV for shadow-immune color detection
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(board_img, cv2.COLOR_BGR2HSV)
 
-    # 3. Process every cell in the 5x5 matrix
+    # 2. Iterate strictly across the 5x5 normalized matrix
     for row in range(GRID_SIZE):
         for col in range(GRID_SIZE):
-            start_x = x + (col * cell_w)
-            end_x = start_x + cell_w
-            start_y = y + (row * cell_h)
-            end_y = start_y + cell_h
+            start_x = col * cell_dim
+            end_x = start_x + cell_dim
+            start_y = row * cell_dim
+            end_y = start_y + cell_dim
             
-            # Draw green box for cell boundaries
-            cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 3)
+            # Draw green cell boundaries
+            cv2.rectangle(output_img, (start_x, start_y), (end_x, end_y), (0, 255, 0), 2)
             
-            # Crop center core (20% padding) to sample token top surfaces cleanly
-            pad_x = int(cell_w * 0.20)
-            pad_y = int(cell_h * 0.20)
-            
-            y1 = max(0, start_y + pad_y)
-            y2 = min(img_h, end_y - pad_y)
-            x1 = max(0, start_x + pad_x)
-            x2 = min(img_w, end_x - pad_x)
-            
-            cell_hsv = hsv[y1:y2, x1:x2]
+            # Crop 22% inner core to avoid border edges
+            pad = int(cell_dim * 0.22)
+            cell_hsv = hsv[start_y + pad:end_y - pad, start_x + pad:end_x - pad]
             
             if cell_hsv.size == 0:
                 continue
 
-            # --- COLOR RANGES IN HSV ---
-            # Red range (handles hue wrap around 0 / 180 degrees)
-            lower_red1 = np.array([0, 50, 40])
+            # --- COLOR SEGMENTATION (HSV) ---
+            # Red token range (handles hue wrap)
+            lower_red1 = np.array([0, 60, 40])
             upper_red1 = np.array([15, 255, 255])
-            lower_red2 = np.array([155, 50, 40])
+            lower_red2 = np.array([155, 60, 40])
             upper_red2 = np.array([180, 255, 255])
             
-            # Blue range (lowered V & S thresholds for shadowed lighting)
-            lower_blue = np.array([85, 40, 30])
+            # Blue token range (lowered S/V floor to pick up shadowed blue tokens)
+            lower_blue = np.array([85, 45, 30])
             upper_blue = np.array([140, 255, 255])
 
             mask_r1 = cv2.inRange(cell_hsv, lower_red1, upper_red1)
@@ -111,10 +153,9 @@ def process_and_draw_board(image_bytes):
             total_pixels = cell_hsv.shape[0] * cell_hsv.shape[1]
 
             status = "no symbol"
-            text_color = (180, 180, 180) # Grey for Empty
+            text_color = (160, 160, 160) # Grey for empty
             
-            # Requires at least 10% coverage of token color in hole core
-            min_threshold = total_pixels * 0.10
+            min_threshold = total_pixels * 0.12
 
             if red_pixels > min_threshold and red_pixels >= blue_pixels:
                 status = "Red"
@@ -130,22 +171,21 @@ def process_and_draw_board(image_bytes):
 
             status_logs.append(f"At position ({row},{col}) there is {status}")
             
-            # --- BOLD, EXTRA-LARGE TEXT OVERLAY ---
+            # --- PROMINENT, BOLD TEXT OVERLAY ---
             display_text = "EMPTY" if status == "no symbol" else status
-            
-            font_scale = max(0.8, cell_w / 75.0)
-            thickness = 3
+            font_scale = 0.75
+            thickness = 2
             
             text_size = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_DUPLEX, font_scale, thickness)[0]
-            cx = start_x + (cell_w - text_size[0]) // 2
-            cy = start_y + (cell_h + text_size[1]) // 2
+            cx = start_x + (cell_dim - text_size[0]) // 2
+            cy = start_y + (cell_dim + text_size[1]) // 2
             
             cv2.putText(output_img, display_text, (cx, cy), 
                         cv2.FONT_HERSHEY_DUPLEX, font_scale, text_color, thickness)
             
     return output_img, status_logs, count_red, count_blue, count_empty
 
-# --- Streamlit Layout ---
+# --- Streamlit Presentation Layer ---
 st.set_page_config(page_title="5x5 Robot Board Scanner", page_icon="🤖", layout="wide")
 
 st.markdown("""
@@ -156,7 +196,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🤖 5x5 Robot Board Matrix Scanner")
-st.write("Strict $5 \\times 5$ matrix detection identifying 3D Red and Blue tokens from empty board slots.")
+st.write("Perspective-corrected $5 \\times 5$ matrix scanner driven by corner anchor dot detection.")
 st.markdown("---")
 
 col1, col2 = st.columns([1, 1], gap="large")
@@ -183,7 +223,7 @@ with col2:
     if uploaded_file is not None and processed_image is not None:
         st.subheader("🖼️ Target 5x5 Grid Scan Map")
         processed_image_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
-        st.image(processed_image_rgb, use_container_width=True, caption="5x5 Matrix Scan Map")
+        st.image(processed_image_rgb, use_container_width=True, caption="5x5 Normalized Board View")
         
         st.subheader("📋 Parsed Coordinate Logs (0 to 4)")
         st.code("\n".join(logs), language="text")
